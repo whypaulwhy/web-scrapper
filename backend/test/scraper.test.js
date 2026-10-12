@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { extractContent, isPrivateAddress, normalizeUrl, ScrapeError } from '../src/scraper.js';
+import { cleanTitle, extractContent, isPrivateAddress, normalizeUrl, ScrapeError } from '../src/scraper.js';
 
 describe('normalizeUrl', () => {
   it('accepts full http(s) URLs', () => {
@@ -74,5 +74,24 @@ describe('extractContent', () => {
     const { title, text } = extractContent('<html><body><h1>Hi</h1><p>Just some text.</p></body></html>');
     assert.equal(title, 'Hi');
     assert.equal(text, 'Hi\nJust some text.');
+  });
+});
+
+describe('cleanTitle', () => {
+  it('drops a trailing site name that matches the domain or og:site_name', () => {
+    assert.equal(cleanTitle('Octopus - Wikipedia', '', 'en.wikipedia.org'), 'Octopus');
+    assert.equal(cleanTitle('How rivers form | The Daily Planet', 'The Daily Planet', 'dailyplanet.com'), 'How rivers form');
+    assert.equal(cleanTitle('Release notes — Acme', '', 'www.acme.io'), 'Release notes');
+  });
+
+  it('leaves real titles alone', () => {
+    for (const title of [
+      'GitHub - expressjs/express: Fast, unopinionated, minimalist web framework for node.',
+      'Pros and cons - a balanced look',
+      'What is JavaScript? - Learn web development | MDN',
+      'Hacker News',
+    ]) {
+      assert.equal(cleanTitle(title, 'MDN Web Docs', 'developer.mozilla.org'), title);
+    }
   });
 });
