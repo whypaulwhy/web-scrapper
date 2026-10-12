@@ -129,8 +129,11 @@ async function postJson(url, headers, body) {
     if (response.status === 429) {
       throw new AiError('The free AI quota is temporarily exhausted. Please wait a minute and try again.', 429);
     }
-    if (response.status === 401 || response.status === 403) {
+    if (response.status === 401 || response.status === 403 || /api key/i.test(detail)) {
       throw new AiError('The server\'s AI API key is invalid or not authorized.', 500);
+    }
+    if (response.status === 404) {
+      throw new AiError('The AI model configured on the server is not available.', 500);
     }
     throw new AiError('The AI service returned an error. Please try again.', 502);
   }

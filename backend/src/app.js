@@ -16,7 +16,7 @@ app.use(express.json({ limit: '10kb' }));
 
 const summarizeLimiter = rateLimit({
   windowMs: 60_000,
-  limit: 15,
+  limit: Number(process.env.RATE_LIMIT_PER_MINUTE) || 15,
   standardHeaders: 'draft-8',
   legacyHeaders: false,
   message: { error: 'Too many requests. Please wait a minute and try again.' },
