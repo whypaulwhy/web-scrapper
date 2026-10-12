@@ -1,28 +1,26 @@
-# AI Web Scraper & Summarizer
+# Gist: AI web scraper & summarizer
 
-A full-stack web app: paste a webpage URL, click **Summarize**, and the backend scrapes the page's main text and sends it to a **free AI API** (Google Gemini by default, Groq also supported). The frontend shows the summary and key points.
+Gist is a full-stack web app. You paste a link to a webpage and click **Summarize**. The backend scrapes the page's main text and sends it to a **free AI API** (Google Gemini by default, Groq also supported), and the frontend shows a short summary with the main points.
 
 **Live demo:** <https://web-scrapper-dun-tau.vercel.app>
-
-![Stack](https://img.shields.io/badge/frontend-React%20%2B%20Vite-0f766e) ![Stack](https://img.shields.io/badge/backend-Node.js%20%2B%20Express-0f766e) ![Stack](https://img.shields.io/badge/AI-Gemini%20%7C%20Groq%20(free%20tier)-0f766e)
 
 ---
 
 ## Features
 
-- **Frontend (React + Vite):** a URL input and a **Summarize** button, a **"Loading..."** state while the backend works, and a summary card with the page title, source link, word count, reading time, the AI summary, key points and a copy button. Errors get their own message and a retry button. Works on phones and supports dark mode.
+- **Frontend (React + Vite):** a link field and a **Summarize** button. While the backend works, the button says **"Loading..."**, a progress line runs under the field, and a timer shows how long it's taking. The summary is laid out like a reading view: source, title, summary, main points, word count and reading time, with buttons to copy the summary or open the page. Errors appear right under the field and say what to do next. Your last five summaries are saved in the browser so you can reopen them instantly. Works on phones, supports light and dark mode, and can be used with the keyboard alone.
 - **Backend (Node.js + Express):** a `POST /api/summarize` endpoint that takes the URL from the frontend.
-- **Scraping (fetch + Cheerio):** downloads the HTML, removes scripts, styles, navigation, headers, footers and sidebars, then pulls the text out of the main `<article>`/`<main>` area (or falls back to `<body>`).
-- **AI integration:** sends the scraped text to **Google Gemini** (`gemini-3.5-flash-lite`) or **Groq** (`llama-3.3-70b-versatile`). Both have free tiers and neither needs OpenAI. The model returns JSON (`summary` + `keyPoints`).
-- **Safety & robustness:** checks the URL is valid, blocks requests to localhost and private networks (SSRF), stops after 15 s or 3 MB, follows at most 5 redirects, rejects pages that aren't HTML, rate-limits requests per IP, and returns readable error messages.
-- **Tests:** unit tests for URL validation, SSRF checks, HTML extraction and AI reply parsing (`npm test`).
+- **Scraping (fetch + Cheerio):** downloads the HTML and removes scripts, styles, navigation, headers, footers, sidebars and hidden elements. It then pulls the text out of the main `<article>`/`<main>` area (falling back to `<body>`) in a single linear pass, so even a 6 MB page takes under a second.
+- **AI integration:** sends the scraped text to **Google Gemini** (`gemini-3.5-flash-lite`) or **Groq** (`llama-3.3-70b-versatile`). Both have free tiers, and nothing uses OpenAI. The model returns JSON (`summary` + `keyPoints`), and the prompt tells it to treat page text as data, not instructions.
+- **Safety & robustness:** the URL is validated, and requests to localhost and private networks are blocked (SSRF protection), including on every redirect. Requests stop after 15 s or 3 MB, follow at most 5 redirects, and anything that isn't HTML or plain text is rejected. HTML nested absurdly deep is refused, requests are rate-limited per IP, and every failure returns a readable error message.
+- **Tests:** 82 automated tests covering URL validation, SSRF bypass tricks, HTML extraction, AI reply parsing, and full API worst cases (see [Testing](#testing)).
 
 ## Tech stack
 
 | Layer      | Technology                                                    |
 | ---------- | ------------------------------------------------------------- |
 | Frontend   | React 19, Vite 8, plain CSS                                   |
-| Backend    | Node.js (>= 20.19), Express 5, Cheerio, express-rate-limit    |
+| Backend    | Node.js (>= 20.19), Express 5, Cheerio (htmlparser2), express-rate-limit |
 | AI         | Google Gemini API (free tier) or Groq API (free tier)          |
 | Deployment | Vercel Services (Vite frontend + Express backend, one domain) |
 
@@ -36,12 +34,12 @@ web-scrapper/
 │   │   ├── server.js        # Local dev server (loads backend/.env, listens on :3001)
 │   │   ├── scraper.js       # URL validation, SSRF protection, fetching & text extraction
 │   │   └── summarizer.js    # Gemini / Groq API calls and response parsing
-│   ├── test/                # Unit tests (node:test)
+│   ├── test/                # Unit + API worst-case tests (node:test)
 │   ├── .env.example         # Template for your .env file  <-- copy this to backend/.env
 │   └── package.json
 ├── frontend/                # React UI (Vite)
 │   ├── src/
-│   │   ├── App.jsx          # Input, Summarize button, loading / error / result states
+│   │   ├── App.jsx          # Link field, Summarize button, loading / error / summary / history
 │   │   ├── api.js           # Calls the backend API
 │   │   ├── main.jsx
 │   │   └── styles.css
@@ -152,6 +150,17 @@ npm start          # starts the backend API only (port 3001)
 
 ---
 
+## Testing
+
+`npm test` runs 82 tests with Node's built-in test runner, in about 3 seconds. The API tests start the real Express app and mock only the outside world (DNS, websites and the Gemini API), so the whole request path is covered:
+
+| Area | Worst cases covered |
+| ---- | ------------------- |
+| Bad input | missing/empty URL, arrays, objects, numbers, `javascript:`, `file:`, `ftp:`, `data:` URLs, credentials in the URL, malformed JSON, form-encoded bodies, oversized bodies |
+| SSRF | `localhost`, `127.0.0.1`, decimal (`2130706433`) and hex (`0x7f.0.0.1`) IPs, `0.0.0.0`, `[::1]`, IPv4-mapped IPv6, cloud metadata (`169.254.169.254`), private ranges, public hostnames that resolve to private IPs, `.local` names, public pages that redirect to private addresses |
+| Websites | redirect loops, 403/404 responses, images/PDF/JSON/video, JavaScript-only pages, empty pages, connection failures, timeouts, unknown domains, a 6 MB page (must finish in under 5 s), 50,000-level nested HTML (rejected in under 3 s), non-UTF-8 charsets, unknown charsets, broken HTML, plain text |
+| AI | quota exhausted (429), invalid API key (and the key never leaks), unknown model, outage (503 HTML), timeout, safety block, empty reply, non-JSON reply, missing key |
+
 ## API reference
 
 ### `POST /api/summarize`
@@ -189,7 +198,7 @@ Error response (`4xx` / `5xx`):
 | ------ | ----------------------------------------------------------------------- |
 | 400    | Missing/invalid URL, or a URL pointing to a private/local network        |
 | 415    | The URL isn't an HTML page (for example an image or PDF)                 |
-| 422    | Domain not found, or no readable text on the page                        |
+| 422    | Domain not found, no readable text on the page, or HTML too deeply nested |
 | 429    | Too many requests (15/min per IP), or the free AI quota was reached      |
 | 500    | The server's AI API key is missing or invalid                            |
 | 502/504| The website or the AI service failed or timed out                        |
