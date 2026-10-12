@@ -2,7 +2,7 @@
 
 A full-stack web app: paste a webpage URL, click **Summarize**, and the backend scrapes the page's main text and sends it to a **free AI API** (Google Gemini by default, Groq also supported). The frontend shows the summary and key points.
 
-**Live demo:** _LIVE_URL_
+**Live demo:** <https://web-scrapper-dun-tau.vercel.app>
 
 ![Stack](https://img.shields.io/badge/frontend-React%20%2B%20Vite-0f766e) ![Stack](https://img.shields.io/badge/backend-Node.js%20%2B%20Express-0f766e) ![Stack](https://img.shields.io/badge/AI-Gemini%20%7C%20Groq%20(free%20tier)-0f766e)
 
@@ -24,7 +24,7 @@ A full-stack web app: paste a webpage URL, click **Summarize**, and the backend 
 | Frontend   | React 19, Vite 8, plain CSS                                   |
 | Backend    | Node.js (>= 20.19), Express 5, Cheerio, express-rate-limit    |
 | AI         | Google Gemini API (free tier) or Groq API (free tier)          |
-| Deployment | Vercel (static frontend + Express as a serverless function)   |
+| Deployment | Vercel Services (Vite frontend + Express backend, one domain) |
 
 ## Project structure
 
@@ -48,8 +48,7 @@ web-scrapper/
 │   ├── index.html
 │   ├── vite.config.js       # Proxies /api to the backend during development
 │   └── package.json
-├── api/index.js             # Vercel serverless entry (reuses backend/src/app.js)
-├── vercel.json              # Vercel build & routing config
+├── vercel.json              # Vercel deployment: frontend + backend services, /api routing
 └── package.json             # npm workspaces + scripts to run both apps
 ```
 
@@ -217,16 +216,19 @@ curl -X POST http://localhost:3001/api/summarize -H "Content-Type: application/j
 
 ## Deployment (Vercel)
 
-The repo deploys to Vercel as-is:
+The live app runs on Vercel at **<https://web-scrapper-dun-tau.vercel.app>**. Every push to `main` deploys it again automatically.
 
-- `vercel.json` builds the frontend (`frontend/dist`) and serves it as static files.
-- `api/index.js` exports the same Express app as a Vercel serverless function. Every `/api/*` request is rewritten to it.
+`vercel.json` uses [Vercel Services](https://vercel.com/docs/services) to run both parts of the repo as one project on one domain:
 
-Steps:
+- **`frontend`** service: `frontend/` is built with Vite and served as static files.
+- **`backend`** service: `backend/` runs the Express app (`backend/src/app.js`) as a Vercel Function.
+- Requests to `/api/*` go to the backend and everything else goes to the frontend. The frontend calls the API on the same domain, so CORS doesn't apply.
 
-1. Import the GitHub repo in Vercel, or run `vercel` from the repo root.
-2. In **Project → Settings → Environment Variables**, add `GEMINI_API_KEY` (or `GROQ_API_KEY`).
-3. Deploy. The frontend and API share one domain, so no CORS setup is needed.
+To deploy your own copy:
+
+1. Import the GitHub repo in Vercel (or run `vercel deploy --prod` from the repo root).
+2. In **Project → Settings → Environment Variables**, add `GEMINI_API_KEY` (or `GROQ_API_KEY`) for the Production environment.
+3. Redeploy, then open `https://<your-app>.vercel.app/api/health`. It should show `"aiConfigured": true`.
 
 ## Limitations
 
