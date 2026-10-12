@@ -1,0 +1,32 @@
+# Checks the deployed app every 6 hours. If the AI key, quota, model or deployment breaks,
+# this run fails and GitHub emails the repository owner.
+name: Live check
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+env:
+  APP_URL: https://web-scrapper-dun-tau.vercel.app
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Health endpoint reports a configured AI key
+        run: |
+          curl -fsS --retry 3 --retry-delay 10 "$APP_URL/api/health" | tee health.json
+          echo
+          node -e "const h = require('./health.json'); if (h.status !== 'ok' || !h.aiConfigured) { console.error('AI is not configured'); process.exit(1); }"
+
+      - name: A real page gets an AI summary
+        run: |
+          curl -fsS --retry 3 --retry-delay 10 -X POST "$APP_URL/api/summarize" \
+            -H 'Content-Type: application/json' \
+            -d '{"url":"https://example.com"}' | tee result.json
+          echo
+          node -e "const r = require('./result.json'); if (!r.summary || r.fallback) { console.error('No AI summary (fallback=' + r.fallback + ')'); process.exit(1); }"
+
+      - name: Frontend is being served
+        run: curl -fsS --retry 3 --retry-delay 10 "$APP_URL/" | grep -q '<div id="root">'
