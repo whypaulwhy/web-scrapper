@@ -1,4 +1,9 @@
-const AI_TIMEOUT_MS = 45_000;
+// Per attempt. Several models may be tried in a row, so each one gets a modest budget.
+const AI_TIMEOUT_MS = 25_000;
+
+// Tried in order after GEMINI_MODEL when a model is rate-limited, unavailable or failing.
+// Each Gemini model has its own free-tier quota, so falling back also spreads the load.
+const DEFAULT_GEMINI_FALLBACK_MODELS = ['gemini-3.1-flash-lite', 'gemini-3.6-flash'];
 
 const PROVIDERS = {
   gemini: {
@@ -28,12 +33,17 @@ Rules:
 - Write in English, in a neutral tone. Do not invent facts that are not in the text.
 - If the text is mostly navigation, errors or boilerplate, say so honestly in the summary.`;
 
-/** Error with an HTTP status and a message that is safe to show to the user. */
+/**
+ * Error with an HTTP status and a message that is safe to show to the user.
+ * `code` says how to react: 'blocked' (the model refused this content) is final;
+ * 'auth' skips the provider's other models; anything else moves on to the next model.
+ */
 export class AiError extends Error {
-  constructor(message, status = 502) {
+  constructor(message, status = 502, code = 'failed') {
     super(message);
     this.name = 'AiError';
     this.status = status;
+    this.code = code;
     this.expose = true;
   }
 }
@@ -58,6 +68,54 @@ export function getProviderConfig(env = process.env) {
     apiKey: (env[provider.keyEnv] || '').trim(),
     model: (env[provider.modelEnv] || '').trim() || provider.defaultModel,
   };
+}
+
+function parseModelList(value, fallback) {
+  if (value === undefined) return fallback;
+  return value
+    .split(',')
+    .map((model) => model.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Every provider/model combination to try, in order. The preferred provider (see getProviderConfig)
+ * comes first with its fallback models; the other provider follows if its key is set.
+ */
+export function getAttemptPlan(env = process.env) {
+  const plans = {};
+  for (const [id, provider] of Object.entries(PROVIDERS)) {
+    const apiKey = (env[provider.keyEnv] || '').trim();
+    if (!apiKey) continue;
+    const primary = (env[provider.modelEnv] || '').trim() || provider.defaultModel;
+    const fallbacks = id === 'gemini' ? parseModelList(env.GEMINI_FALLBACK_MODELS, DEFAULT_GEMINI_FALLBACK_MODELS) : [];
+    const models = [...new Set([primary, ...fallbacks])];
+    plans[id] = models.map((model) => ({ id, label: provider.label, apiKey, model }));
+  }
+
+  const preferred = getProviderConfig(env).id;
+  const order = [preferred, ...Object.keys(PROVIDERS).filter((id) => id !== preferred)];
+  return order.flatMap((id) => plans[id] || []);
+}
+
+/**
+ * Last resort when no AI model can be reached: the page's own description or its opening sentences.
+ * Clearly labelled as such in the response, so it never passes for an AI summary.
+ */
+export function extractiveSummary(page) {
+  if (page.description && page.description.length >= 80) return page.description;
+
+  const sentences = [];
+  let length = 0;
+  for (const line of page.text.split('\n')) {
+    if (line.split(' ').length < 8) continue; // Skip headings, menus and captions.
+    for (const sentence of line.split(/(?<=[.!?])\s+/)) {
+      sentences.push(sentence);
+      length += sentence.length;
+      if (sentences.length >= 3 || length >= 450) return sentences.join(' ');
+    }
+  }
+  return sentences.join(' ') || page.description || page.text.slice(0, 450);
 }
 
 function buildUserPrompt(page) {
@@ -102,7 +160,7 @@ export function parseSummary(raw) {
     }
   }
 
-  if (!unfenced) throw new AiError('The AI returned an empty response. Please try again.');
+  if (!unfenced) throw new AiError('The AI returned an empty response. Please try again.', 502, 'empty');
   return { summary: unfenced, keyPoints: [] };
 }
 
@@ -117,23 +175,23 @@ async function postJson(url, headers, body) {
     });
   } catch (err) {
     if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
-      throw new AiError('The AI service took too long to respond. Please try again.', 504);
+      throw new AiError('The AI service took too long to respond. Please try again.', 504, 'timeout');
     }
-    throw new AiError('Could not reach the AI service. Please try again.', 502);
+    throw new AiError('Could not reach the AI service. Please try again.', 502, 'network');
   }
 
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     const detail = data?.error?.message || `HTTP ${response.status}`;
-    console.error(`[ai] request failed (${response.status}): ${detail}`);
+    console.error(`[ai] ${url.split('?')[0]} failed (${response.status}): ${detail}`);
     if (response.status === 429) {
-      throw new AiError('The free AI quota is temporarily exhausted. Please wait a minute and try again.', 429);
+      throw new AiError('The free AI quota is temporarily exhausted. Please wait a minute and try again.', 429, 'quota');
     }
     if (response.status === 401 || response.status === 403 || /api key/i.test(detail)) {
-      throw new AiError('The server\'s AI API key is invalid or not authorized.', 500);
+      throw new AiError('The server\'s AI API key is invalid or not authorized.', 500, 'auth');
     }
     if (response.status === 404) {
-      throw new AiError('The AI model configured on the server is not available.', 500);
+      throw new AiError('The AI model configured on the server is not available.', 500, 'model');
     }
     throw new AiError('The AI service returned an error. Please try again.', 502);
   }
@@ -158,7 +216,7 @@ async function callGemini(config, page) {
     .map((part) => part.text || '')
     .join('');
   if (!text && (data?.promptFeedback?.blockReason || candidate?.finishReason === 'SAFETY')) {
-    throw new AiError('The AI declined to summarize this page.', 422);
+    throw new AiError('The AI declined to summarize this page.', 422, 'blocked');
   }
   return text;
 }
@@ -180,16 +238,33 @@ async function callGroq(config, page) {
   return data?.choices?.[0]?.message?.content || '';
 }
 
-/** Sends scraped page content to the configured free AI API and returns a structured summary. */
+/**
+ * Sends scraped page content to the free AI APIs and returns a structured summary.
+ * Tries each model in getAttemptPlan() until one succeeds; throws the last error if all fail.
+ */
 export async function summarizePage(page, env = process.env) {
-  const config = getProviderConfig(env);
-  if (!config.apiKey) {
-    console.error(`[ai] ${config.keyEnv} is not set. Add it to backend/.env (see README).`);
-    throw new AiError('The AI service is not configured on the server (missing API key).', 500);
+  const attempts = getAttemptPlan(env);
+  if (attempts.length === 0) {
+    console.error('[ai] No AI API key is set. Add GEMINI_API_KEY or GROQ_API_KEY to backend/.env (see README).');
+    throw new AiError('The AI service is not configured on the server (missing API key).', 500, 'config');
   }
 
-  const raw = config.id === 'groq' ? await callGroq(config, page) : await callGemini(config, page);
-  const { summary, keyPoints } = parseSummary(raw);
+  const providersWithBadKeys = new Set();
+  let lastError;
 
-  return { summary, keyPoints, provider: config.label, model: config.model };
+  for (const attempt of attempts) {
+    if (providersWithBadKeys.has(attempt.id)) continue;
+    try {
+      const raw = attempt.id === 'groq' ? await callGroq(attempt, page) : await callGemini(attempt, page);
+      const { summary, keyPoints } = parseSummary(raw);
+      return { summary, keyPoints, provider: attempt.label, model: attempt.model };
+    } catch (err) {
+      if (!(err instanceof AiError) || err.code === 'blocked') throw err;
+      if (err.code === 'auth') providersWithBadKeys.add(attempt.id);
+      console.warn(`[ai] ${attempt.label} ${attempt.model} failed (${err.code}); trying the next model if any.`);
+      lastError = err;
+    }
+  }
+
+  throw lastError;
 }

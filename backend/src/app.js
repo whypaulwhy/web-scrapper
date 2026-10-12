@@ -1,10 +1,20 @@
 import cors from 'cors';
 import express from 'express';
 import { rateLimit } from 'express-rate-limit';
+import { createCache } from './cache.js';
 import { normalizeUrl, scrapePage } from './scraper.js';
-import { getProviderConfig, summarizePage } from './summarizer.js';
+import { AiError, extractiveSummary, getAttemptPlan, getProviderConfig, summarizePage } from './summarizer.js';
 
 const WORDS_PER_MINUTE = 230;
+
+const FALLBACK_NOTICE =
+  "The AI service couldn't be reached just now, so this is the opening of the page instead of a summary. Try again in a minute.";
+
+// Successful summaries are reused for 6 hours so repeat requests don't spend the free AI quota.
+export const summaryCache = createCache({
+  ttlMs: process.env.SUMMARY_CACHE_TTL_MS !== undefined ? Number(process.env.SUMMARY_CACHE_TTL_MS) : 6 * 60 * 60 * 1000,
+  maxEntries: 200,
+});
 
 const app = express();
 
@@ -24,21 +34,37 @@ const summarizeLimiter = rateLimit({
 
 app.get('/api/health', (req, res) => {
   const config = getProviderConfig();
+  const attempts = getAttemptPlan();
   res.json({
     status: 'ok',
     provider: config.label,
     model: config.model,
-    aiConfigured: Boolean(config.apiKey),
+    aiConfigured: attempts.length > 0,
+    models: attempts.map((attempt) => `${attempt.label}: ${attempt.model}`),
   });
 });
 
 app.post('/api/summarize', summarizeLimiter, async (req, res, next) => {
   try {
     const url = normalizeUrl(req.body?.url);
-    const page = await scrapePage(url);
-    const ai = await summarizePage(page);
 
-    res.json({
+    const cached = summaryCache.get(url.href);
+    if (cached) return res.json({ ...cached, cached: true });
+
+    const page = await scrapePage(url);
+
+    let ai;
+    try {
+      ai = await summarizePage(page);
+    } catch (err) {
+      // If every AI model failed (quota, outage, bad key...), still give the reader something useful,
+      // clearly marked as not being an AI summary. A model refusing the content is reported as-is.
+      if (!(err instanceof AiError) || err.code === 'blocked') throw err;
+      console.error(`[ai] All models failed (last: ${err.code}); returning an extract instead.`);
+      ai = { summary: extractiveSummary(page), keyPoints: [], provider: null, model: null, fallback: true };
+    }
+
+    const result = {
       url: page.url,
       title: page.title,
       description: page.description,
@@ -49,7 +75,15 @@ app.post('/api/summarize', summarizeLimiter, async (req, res, next) => {
       truncated: page.truncated,
       provider: ai.provider,
       model: ai.model,
-    });
+      fallback: Boolean(ai.fallback),
+      ...(ai.fallback ? { notice: FALLBACK_NOTICE } : {}),
+    };
+
+    if (!result.fallback) {
+      summaryCache.set(url.href, result);
+      if (page.url !== url.href) summaryCache.set(page.url, result);
+    }
+    res.json(result);
   } catch (err) {
     next(err);
   }
