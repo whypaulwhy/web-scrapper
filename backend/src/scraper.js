@@ -29,10 +29,61 @@ const MAIN_CONTENT_SELECTORS = [
   '.post-content', '.entry-content', '.article-body', '.content',
 ];
 
-const BLOCK_SELECTORS = [
-  'p', 'div', 'section', 'article', 'main', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
-  'li', 'dt', 'dd', 'blockquote', 'pre', 'figcaption', 'caption', 'tr', 'td', 'th',
-].join(',');
+const BLOCK_TAGS = new Set([
+  'p', 'div', 'section', 'article', 'main', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'ul', 'ol',
+  'li', 'dl', 'dt', 'dd', 'blockquote', 'pre', 'figure', 'figcaption', 'table', 'caption', 'tr', 'td', 'th',
+]);
+
+const MAX_CANDIDATES_PER_SELECTOR = 25;
+// Real pages are rarely nested more than ~50 levels deep. Anything far beyond this is broken or hostile
+// markup that would make CSS selector matching very slow, so it is rejected up front.
+const MAX_DOM_DEPTH = 1_000;
+const BLOCK_END = Symbol('block-end');
+
+/** Depth of the deepest element in the document, measured iteratively. */
+function maxDepth(rootNode) {
+  let deepest = 0;
+  const stack = [[rootNode, 0]];
+  while (stack.length) {
+    const [node, depth] = stack.pop();
+    if (depth > deepest) deepest = depth;
+    if (deepest > MAX_DOM_DEPTH) break;
+    for (const child of node.children || []) {
+      if (child.type === 'tag') stack.push([child, depth + 1]);
+    }
+  }
+  return deepest;
+}
+
+/**
+ * Returns the readable text under a DOM node, with line breaks around block elements and
+ * HTML source whitespace collapsed (like a browser renders it). Iterative, so it runs in
+ * linear time and can't overflow the stack on deeply nested markup.
+ */
+function collectText(rootNode) {
+  const out = [];
+  const stack = [rootNode];
+  while (stack.length) {
+    const node = stack.pop();
+    if (node === BLOCK_END) {
+      out.push('\n');
+    } else if (node.type === 'text') {
+      out.push(node.data.replace(/\s+/g, ' '));
+    } else if (node.type === 'tag' || node.type === 'root') {
+      if (node.name === 'br') {
+        out.push('\n');
+        continue;
+      }
+      if (BLOCK_TAGS.has(node.name)) {
+        out.push('\n');
+        stack.push(BLOCK_END);
+      }
+      const children = node.children || [];
+      for (let i = children.length - 1; i >= 0; i -= 1) stack.push(children[i]);
+    }
+  }
+  return out.join('');
+}
 
 /** Error with an HTTP status and a message that is safe to show to the user. */
 export class ScrapeError extends Error {
@@ -234,7 +285,12 @@ function cleanLines(text) {
  * Exported separately so it can be unit tested without network access.
  */
 export function extractContent(html) {
-  const $ = cheerio.load(html);
+  // htmlparser2 (via `xml: { xmlMode: false }`) parses HTML in linear time; Cheerio's default
+  // parse5 parser is spec-exact but slows to tens of seconds on deeply nested or hostile markup.
+  const $ = cheerio.load(html, { xml: { xmlMode: false, decodeEntities: true } });
+  if (maxDepth($.root().get(0)) > MAX_DOM_DEPTH) {
+    throw new ScrapeError("This page's HTML is nested too deeply to process.", 422);
+  }
 
   const title = (
     $('meta[property="og:title"]').attr('content') ||
@@ -249,48 +305,56 @@ export function extractContent(html) {
     ''
   ).replace(/\s+/g, ' ').trim();
 
-  $(NOISE_SELECTORS).remove();
-  $('[style*="display:none"], [style*="display: none"]').remove();
+  $(`${NOISE_SELECTORS},[style*="display:none"],[style*="display: none"]`).remove();
 
   let root = null;
   for (const selector of MAIN_CONTENT_SELECTORS) {
     // Pick the largest match for this selector (pages often have several <article>s, e.g. comments).
+    // Only the first few matches are measured so pathological pages can't make this quadratic.
     let best = null;
     let bestLength = 0;
-    $(selector).each((_, el) => {
-      const length = $(el).text().replace(/\s+/g, ' ').trim().length;
+    for (const el of $(selector).slice(0, MAX_CANDIDATES_PER_SELECTOR).toArray()) {
+      const length = collectText(el).replace(/\s+/g, ' ').trim().length;
       if (length > bestLength) {
-        best = $(el);
+        best = el;
         bestLength = length;
       }
-    });
+    }
     if (best && bestLength >= 200) {
       root = best;
       break;
     }
   }
-  if (!root) root = $('body').length ? $('body') : $.root();
+  if (!root) root = $('body').get(0) || $.root().get(0);
 
-  // Collapse HTML source whitespace (like a browser does), then put line breaks
-  // around block elements so their text doesn't run together.
-  root.find('*').addBack().contents().each((_, node) => {
-    if (node.type === 'text') node.data = node.data.replace(/\s+/g, ' ');
-  });
-  root.find('br').replaceWith('\n');
-  root.find(BLOCK_SELECTORS).each((_, el) => {
-    $(el).prepend('\n').append('\n');
-  });
+  const siteName = ($('meta[property="og:site_name"]').attr('content') || '').trim();
 
-  return { title, description, text: cleanLines(root.text()) };
+  return { title, siteName, description, text: cleanLines(collectText(root)) };
+}
+
+/**
+ * Drops a trailing site name from a page title ("Octopus - Wikipedia" -> "Octopus"),
+ * but only when the suffix clearly is the site's name, so real titles are left alone.
+ */
+export function cleanTitle(title, siteName, hostname) {
+  const match = /^(.{4,}?)\s+[-|–—·]\s+([^-|–—·]{2,40})$/.exec(title);
+  if (!match) return title;
+
+  const squash = (value) => (value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const suffix = squash(match[2]);
+  if (!suffix) return title;
+  if (suffix === squash(siteName) || squash(hostname).includes(suffix)) return match[1].trim();
+  return title;
 }
 
 /** Scrapes a URL and returns its main text content, ready to be summarized. */
 export async function scrapePage(url) {
   const { body, finalUrl, isPlainText } = await fetchPage(url);
 
-  const { title, description, text } = isPlainText
-    ? { title: '', description: '', text: cleanLines(body) }
+  const { title, siteName, description, text } = isPlainText
+    ? { title: '', siteName: '', description: '', text: cleanLines(body) }
     : extractContent(body);
+  const hostname = new URL(finalUrl).hostname;
 
   if (text.length < MIN_CONTENT_CHARS && description.length < MIN_CONTENT_CHARS) {
     throw new ScrapeError(
@@ -305,7 +369,7 @@ export async function scrapePage(url) {
 
   return {
     url: finalUrl,
-    title: title || new URL(finalUrl).hostname,
+    title: cleanTitle(title, siteName, hostname) || hostname,
     description,
     text: truncated ? fullText.slice(0, MAX_CONTENT_CHARS) : fullText,
     wordCount,
