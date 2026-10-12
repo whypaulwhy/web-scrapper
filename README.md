@@ -4,6 +4,14 @@ Gist is a full-stack web app. You paste a link to a webpage and click **Summariz
 
 **Live demo:** <https://web-scrapper-dun-tau.vercel.app>
 
+<p>
+  <img src="docs/screenshot.png" alt="Gist on desktop: a Wikipedia article about octopuses summarized into a short paragraph and five main points" width="68%">
+  &nbsp;
+  <img src="docs/screenshot-mobile.png" alt="Gist on a phone in dark mode, showing the same summary" width="26%">
+</p>
+
+<sub>Screenshots of the live app summarizing a real Wikipedia article with Gemini, on desktop (light mode) and on a phone (dark mode).</sub>
+
 ---
 
 ## Features
@@ -13,7 +21,8 @@ Gist is a full-stack web app. You paste a link to a webpage and click **Summariz
 - **Scraping (fetch + Cheerio):** downloads the HTML and removes scripts, styles, navigation, headers, footers, sidebars and hidden elements. It then pulls the text out of the main `<article>`/`<main>` area (falling back to `<body>`) in a single linear pass, so even a 6 MB page takes under a second.
 - **AI integration:** sends the scraped text to **Google Gemini** (`gemini-3.5-flash-lite`) or **Groq** (`llama-3.3-70b-versatile`). Both have free tiers, and nothing uses OpenAI. The model returns JSON (`summary` + `keyPoints`), and the prompt tells it to treat page text as data, not instructions.
 - **Safety & robustness:** the URL is validated, and requests to localhost and private networks are blocked (SSRF protection), including on every redirect. Requests stop after 15 s or 3 MB, follow at most 5 redirects, and anything that isn't HTML or plain text is rejected. HTML nested absurdly deep is refused, requests are rate-limited per IP, and every failure returns a readable error message.
-- **Tests:** 82 automated tests covering URL validation, SSRF bypass tricks, HTML extraction, AI reply parsing, and full API worst cases (see [Testing](#testing)).
+- **Built to keep working:** if a Gemini model is rate-limited or down, the backend tries backup models and then Groq. If no AI can be reached at all, it shows the page's opening sentences, clearly labelled. Summaries are cached, and the live site is checked automatically every 6 hours (see [Reliability](#reliability)).
+- **Tests:** 95 automated tests covering URL validation, SSRF bypass tricks, HTML extraction, AI reply parsing, the fallback chain, caching and full API worst cases (see [Testing](#testing)). They run on GitHub Actions on every push.
 
 ## Tech stack
 
@@ -102,12 +111,17 @@ All supported variables:
 | `GEMINI_API_KEY` | one of   | –                         | Google Gemini API key                                              |
 | `GROQ_API_KEY`   | one of   | –                         | Groq API key                                                       |
 | `AI_PROVIDER`    | no       | auto                      | `gemini` or `groq`. If unset, uses whichever key is present (Gemini first). |
-| `GEMINI_MODEL`   | no       | `gemini-3.5-flash-lite`   | Gemini model to use                                                |
+| `GEMINI_MODEL`   | no       | `gemini-3.5-flash-lite`   | Gemini model to try first                                          |
+| `GEMINI_FALLBACK_MODELS` | no | `gemini-3.1-flash-lite,gemini-3.6-flash` | Comma-separated Gemini models to try next if the first fails. Set it to an empty value to disable. |
 | `GROQ_MODEL`     | no       | `llama-3.3-70b-versatile` | Groq model to use                                                  |
 | `PORT`           | no       | `3001`                    | Port for the local backend                                         |
 | `CORS_ORIGIN`    | no       | `*`                       | Allowed origin if the frontend is hosted on another domain         |
+| `RATE_LIMIT_PER_MINUTE` | no | `15`                    | Summaries allowed per minute per IP address                        |
+| `SUMMARY_CACHE_TTL_MS`  | no | `21600000` (6 hours)    | How long a summary is reused for the same link. `0` disables the cache. |
 
 > `backend/.env` is listed in `.gitignore`, so it never gets committed. Don't put API keys in the frontend.
+>
+> **Tip:** set both `GEMINI_API_KEY` and `GROQ_API_KEY`. The app uses Gemini and only switches to Groq if every Gemini model fails.
 
 ### 4. Start the backend and frontend
 
@@ -152,14 +166,15 @@ npm start          # starts the backend API only (port 3001)
 
 ## Testing
 
-`npm test` runs 82 tests with Node's built-in test runner, in about 3 seconds. The API tests start the real Express app and mock only the outside world (DNS, websites and the Gemini API), so the whole request path is covered:
+`npm test` runs 95 tests with Node's built-in test runner, in about 3 seconds. GitHub Actions runs them, plus a production build, on every push (`.github/workflows/ci.yml`). The API tests start the real Express app and mock only the outside world (DNS, websites and the Gemini API), so the whole request path is covered:
 
 | Area | Worst cases covered |
 | ---- | ------------------- |
 | Bad input | missing/empty URL, arrays, objects, numbers, `javascript:`, `file:`, `ftp:`, `data:` URLs, credentials in the URL, malformed JSON, form-encoded bodies, oversized bodies |
 | SSRF | `localhost`, `127.0.0.1`, decimal (`2130706433`) and hex (`0x7f.0.0.1`) IPs, `0.0.0.0`, `[::1]`, IPv4-mapped IPv6, cloud metadata (`169.254.169.254`), private ranges, public hostnames that resolve to private IPs, `.local` names, public pages that redirect to private addresses |
 | Websites | redirect loops, 403/404 responses, images/PDF/JSON/video, JavaScript-only pages, empty pages, connection failures, timeouts, unknown domains, a 6 MB page (must finish in under 5 s), 50,000-level nested HTML (rejected in under 3 s), non-UTF-8 charsets, unknown charsets, broken HTML, plain text |
-| AI | quota exhausted (429), invalid API key (and the key never leaks), unknown model, outage (503 HTML), timeout, safety block, empty reply, non-JSON reply, missing key |
+| AI | quota exhausted on one model (falls back to the next), on every model (labelled extract), invalid API key (stops retrying, key never leaks), retired model, Gemini down with Groq configured (switches to Groq), outage (503 HTML), timeout, safety block, empty reply, non-JSON reply, missing key |
+| Cache | repeat requests reuse the summary without calling the AI; extracts are never cached; expiry and size limits |
 
 ## API reference
 
@@ -176,7 +191,7 @@ Successful response (`200`):
 ```json
 {
   "url": "https://en.wikipedia.org/wiki/Web_scraping",
-  "title": "Web scraping - Wikipedia",
+  "title": "Web scraping",
   "description": "",
   "summary": "Web scraping is the automated extraction of data from websites...",
   "keyPoints": ["...", "..."],
@@ -184,9 +199,12 @@ Successful response (`200`):
   "readingTimeMinutes": 19,
   "truncated": true,
   "provider": "Google Gemini",
-  "model": "gemini-3.5-flash-lite"
+  "model": "gemini-3.5-flash-lite",
+  "fallback": false
 }
 ```
+
+`cached: true` is added when the summary was served from the cache. If no AI model could be reached, the response is still `200`, with `"fallback": true`, `"model": null`, the page's opening sentences as `summary`, and a `notice` explaining that it isn't an AI summary.
 
 Error response (`4xx` / `5xx`):
 
@@ -199,13 +217,13 @@ Error response (`4xx` / `5xx`):
 | 400    | Missing/invalid URL, or a URL pointing to a private/local network        |
 | 415    | The URL isn't an HTML page (for example an image or PDF)                 |
 | 422    | Domain not found, no readable text on the page, or HTML too deeply nested |
-| 429    | Too many requests (15/min per IP), or the free AI quota was reached      |
-| 500    | The server's AI API key is missing or invalid                            |
-| 502/504| The website or the AI service failed or timed out                        |
+| 422    | The AI model refused to summarize the content                            |
+| 429    | Too many requests (15/min per IP)                                        |
+| 502/504| The website failed or timed out                                          |
 
 ### `GET /api/health`
 
-Returns `{ "status": "ok", "provider": "...", "model": "...", "aiConfigured": true }`. You can use it to check whether the API key was picked up.
+Returns `{ "status": "ok", "provider": "...", "model": "...", "aiConfigured": true, "models": [...] }`. `models` lists every model the server will try, in order. Use it to check that the API key was picked up.
 
 Quick test with curl:
 
@@ -220,12 +238,25 @@ curl -X POST http://localhost:3001/api/summarize -H "Content-Type: application/j
 1. The user pastes a URL and clicks **Summarize**. The React app sends `POST /api/summarize` and shows **Loading...**.
 2. The backend checks the URL (http/https only, the host must resolve to a public IP) and downloads the HTML. It follows redirects itself so it can check every hop.
 3. Cheerio removes `<script>`, `<style>`, `<nav>`, `<header>`, `<footer>`, `<aside>`, forms and hidden elements. It then picks the main content container and turns block elements into clean lines of text. Pages longer than 15,000 characters get cut to that length.
-4. The text goes to the AI with a prompt asking for a 2–4 sentence summary and 3–5 key points as JSON. The prompt tells the model to treat the page text as data and ignore any instructions in it.
-5. The backend sends back the summary plus some page details, and the frontend shows them in a card.
+4. The text goes to the AI with a prompt asking for a 2–4 sentence summary and 3–5 key points as JSON. The prompt tells the model to treat the page text as data and ignore any instructions in it. If a model fails, the next one in the chain is tried.
+5. The backend sends back the summary plus some page details, and the frontend shows them as a reading view.
+
+## Reliability
+
+The live demo has to keep working for days without anyone watching it, so a single free-tier hiccup shouldn't break it:
+
+| Risk | What happens |
+| ---- | ------------ |
+| A Gemini model hits its free quota or is overloaded | The next model in `GEMINI_FALLBACK_MODELS` is tried. Each model has its own free quota. |
+| A Gemini model is retired | Same: it is skipped and the next one is used. |
+| Gemini is down or the key stops working | If `GROQ_API_KEY` is set, Groq takes over. |
+| No AI can be reached at all | The page's description or opening sentences are shown, with a notice saying it isn't an AI summary. The user never gets a blank error. |
+| The same link is summarized again and again | The summary is reused for 6 hours, so it doesn't burn quota. |
+| Something breaks anyway | `.github/workflows/live-check.yml` calls the live `/api/health` and summarizes a real page every 6 hours. If that fails, GitHub emails the repo owner. |
 
 ## Deployment (Vercel)
 
-The live app runs on Vercel at **<https://web-scrapper-dun-tau.vercel.app>**. Every push to `main` deploys it again automatically.
+The live app runs on Vercel at **<https://web-scrapper-dun-tau.vercel.app>**.
 
 `vercel.json` uses [Vercel Services](https://vercel.com/docs/services) to run both parts of the repo as one project on one domain:
 
