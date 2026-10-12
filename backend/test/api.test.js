@@ -6,10 +6,13 @@ import { after, before, beforeEach, describe, it, mock } from 'node:test';
 
 process.env.GEMINI_API_KEY = 'test-key';
 process.env.RATE_LIMIT_PER_MINUTE = '10000';
+delete process.env.GEMINI_MODEL;
+delete process.env.GEMINI_FALLBACK_MODELS;
+delete process.env.SUMMARY_CACHE_TTL_MS;
 delete process.env.GROQ_API_KEY;
 delete process.env.AI_PROVIDER;
 
-const { default: app } = await import('../src/app.js');
+const { default: app, summaryCache } = await import('../src/app.js');
 
 const realFetch = globalThis.fetch;
 const PUBLIC_IP = '93.184.216.34';
@@ -22,8 +25,9 @@ const ARTICLE = `<!doctype html><html><head><title>Test article</title></head><b
 let server;
 let base;
 let pages; // Map<href, (init) => Response>
-let aiHandler; // (requestBody) => Response
+let aiHandler; // (requestBody, model) => Response
 let lastAiRequest;
+let aiModelsCalled; // models requested from the AI API, in order
 
 const html = (body, status = 200, type = 'text/html; charset=utf-8') =>
   new Response(body, { status, headers: { 'content-type': type } });
@@ -37,7 +41,9 @@ before(async () => {
     if (url.origin === base) return realFetch(input, init);
     if (url.hostname === 'generativelanguage.googleapis.com') {
       lastAiRequest = JSON.parse(init.body);
-      return aiHandler(lastAiRequest);
+      const model = decodeURIComponent(url.pathname.split('/models/')[1].split(':')[0]);
+      aiModelsCalled.push(model);
+      return aiHandler(lastAiRequest, model);
     }
     const page = pages.get(url.href);
     return page ? page(init) : html('<h1>Not found</h1>', 404);
@@ -58,6 +64,8 @@ beforeEach(() => {
   pages = new Map([['https://site.test/article', () => html(ARTICLE)]]);
   aiHandler = () => gemini('{"summary":"A test summary.","keyPoints":["One","Two","Three"]}');
   lastAiRequest = null;
+  aiModelsCalled = [];
+  summaryCache.clear();
 });
 
 async function summarize(body, contentType = 'application/json') {
@@ -297,75 +305,139 @@ describe('misbehaving websites', () => {
   });
 });
 
-describe('AI failures', () => {
+describe('AI failures and fallbacks', () => {
   const errorReply = (status, message) => () => Response.json({ error: { message } }, { status });
+  const ARTICLE_URL = 'https://site.test/article';
 
-  it('reports exhausted free quota as 429', async () => {
-    aiHandler = errorReply(429, 'Resource has been exhausted');
-    const { status, body } = await summarize({ url: 'https://site.test/article' });
-    assert.equal(status, 429);
-    assert.match(body.error, /quota/);
+  async function expectExtractFallback() {
+    const { status, body } = await summarize({ url: ARTICLE_URL });
+    assert.equal(status, 200);
+    assert.equal(body.fallback, true);
+    assert.match(body.notice, /instead of a summary/);
+    assert.match(body.summary, /real article content/);
+    assert.equal(body.model, null);
+    return body;
+  }
+
+  it('falls back to the next Gemini model when the first is rate-limited', async () => {
+    aiHandler = (_, model) =>
+      model === 'gemini-3.5-flash-lite'
+        ? errorReply(429, 'Resource has been exhausted')()
+        : gemini('{"summary":"From the backup model.","keyPoints":[]}');
+    const { status, body } = await summarize({ url: ARTICLE_URL });
+    assert.equal(status, 200);
+    assert.equal(body.summary, 'From the backup model.');
+    assert.equal(body.model, 'gemini-3.1-flash-lite');
+    assert.equal(body.fallback, false);
+    assert.deepEqual(aiModelsCalled, ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite']);
   });
 
-  it('reports an invalid API key without leaking it', async () => {
+  it('skips a model that no longer exists', async () => {
+    aiHandler = (_, model) =>
+      model === 'gemini-3.5-flash-lite' ? errorReply(404, 'models/x is not found')() : gemini('{"summary":"OK","keyPoints":[]}');
+    const { body } = await summarize({ url: ARTICLE_URL });
+    assert.equal(body.model, 'gemini-3.1-flash-lite');
+  });
+
+  it('tries every model, then returns a labelled extract when the quota is exhausted everywhere', async () => {
+    aiHandler = errorReply(429, 'Resource has been exhausted');
+    await expectExtractFallback();
+    assert.deepEqual(aiModelsCalled, ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.6-flash']);
+  });
+
+  it('stops retrying Gemini after an invalid key, without leaking the key', async () => {
     aiHandler = errorReply(400, 'API key not valid. Please pass a valid API key.');
-    const { status, body } = await summarize({ url: 'https://site.test/article' });
-    assert.equal(status, 500);
-    assert.match(body.error, /API key is invalid/);
+    const body = await expectExtractFallback();
+    assert.equal(aiModelsCalled.length, 1);
     assert.doesNotMatch(JSON.stringify(body), /test-key/);
   });
 
-  it('reports an unavailable model', async () => {
-    aiHandler = errorReply(404, 'models/xyz is not found');
-    const { status, body } = await summarize({ url: 'https://site.test/article' });
-    assert.equal(status, 500);
-    assert.match(body.error, /model/);
+  it('switches to Groq when Gemini is down and a Groq key is set', async () => {
+    process.env.GROQ_API_KEY = 'groq-test-key';
+    try {
+      aiHandler = errorReply(503, 'overloaded');
+      pages.set('https://api.groq.com/openai/v1/chat/completions', () =>
+        Response.json({ choices: [{ message: { content: '{"summary":"From Groq.","keyPoints":["a"]}' } }] }),
+      );
+      const { status, body } = await summarize({ url: ARTICLE_URL });
+      assert.equal(status, 200);
+      assert.equal(body.provider, 'Groq');
+      assert.equal(body.summary, 'From Groq.');
+    } finally {
+      delete process.env.GROQ_API_KEY;
+    }
   });
 
-  it('reports an AI outage', async () => {
+  it('returns an extract during an AI outage (HTML error page)', async () => {
     aiHandler = () => new Response('<html>Service Unavailable</html>', { status: 503 });
-    const { status } = await summarize({ url: 'https://site.test/article' });
-    assert.equal(status, 502);
+    await expectExtractFallback();
   });
 
-  it('reports an AI timeout', async () => {
+  it('returns an extract when the AI times out', async () => {
     aiHandler = () => {
       throw new DOMException('The operation timed out.', 'TimeoutError');
     };
-    const { status } = await summarize({ url: 'https://site.test/article' });
-    assert.equal(status, 504);
+    await expectExtractFallback();
   });
 
-  it('reports content the AI refused to summarize', async () => {
-    aiHandler = () => Response.json({ promptFeedback: { blockReason: 'SAFETY' } });
-    const { status } = await summarize({ url: 'https://site.test/article' });
-    assert.equal(status, 422);
-  });
-
-  it('reports an empty AI reply', async () => {
+  it('returns an extract when the AI keeps sending empty replies', async () => {
     aiHandler = () => Response.json({ candidates: [] });
-    const { status } = await summarize({ url: 'https://site.test/article' });
-    assert.equal(status, 502);
+    await expectExtractFallback();
+  });
+
+  it('returns an extract when no API key is configured at all', async () => {
+    const saved = process.env.GEMINI_API_KEY;
+    delete process.env.GEMINI_API_KEY;
+    try {
+      await expectExtractFallback();
+      assert.equal(aiModelsCalled.length, 0);
+    } finally {
+      process.env.GEMINI_API_KEY = saved;
+    }
+  });
+
+  it('prefers the meta description for the extract when the page has a good one', async () => {
+    const description = 'A carefully written description of this page that is long enough to stand in for a summary.';
+    pages.set('https://site.test/described', () =>
+      html(ARTICLE.replace('<title>', `<meta name="description" content="${description}"><title>`)),
+    );
+    aiHandler = errorReply(429, 'exhausted');
+    const { body } = await summarize({ url: 'https://site.test/described' });
+    assert.equal(body.summary, description);
+  });
+
+  it('reports content the AI refused to summarize instead of falling back', async () => {
+    aiHandler = () => Response.json({ promptFeedback: { blockReason: 'SAFETY' } });
+    const { status } = await summarize({ url: ARTICLE_URL });
+    assert.equal(status, 422);
   });
 
   it('still shows a reply that is not valid JSON', async () => {
     aiHandler = () => gemini('This page is about testing.');
-    const { status, body } = await summarize({ url: 'https://site.test/article' });
+    const { status, body } = await summarize({ url: ARTICLE_URL });
     assert.equal(status, 200);
     assert.equal(body.summary, 'This page is about testing.');
     assert.deepEqual(body.keyPoints, []);
   });
+});
 
-  it('reports a missing API key', async () => {
-    const saved = process.env.GEMINI_API_KEY;
-    delete process.env.GEMINI_API_KEY;
-    try {
-      const { status, body } = await summarize({ url: 'https://site.test/article' });
-      assert.equal(status, 500);
-      assert.match(body.error, /missing API key/);
-    } finally {
-      process.env.GEMINI_API_KEY = saved;
-    }
+describe('caching', () => {
+  it('reuses a successful summary instead of calling the AI again', async () => {
+    const first = await summarize({ url: 'https://site.test/article' });
+    const second = await summarize({ url: 'site.test/article' });
+    assert.equal(first.body.cached, undefined);
+    assert.equal(second.body.cached, true);
+    assert.equal(second.body.summary, first.body.summary);
+    assert.equal(aiModelsCalled.length, 1);
+  });
+
+  it('does not cache extracts, so the next request tries the AI again', async () => {
+    aiHandler = () => Response.json({ error: { message: 'exhausted' } }, { status: 429 });
+    await summarize({ url: 'https://site.test/article' });
+    aiHandler = () => gemini('{"summary":"Back online.","keyPoints":[]}');
+    const { body } = await summarize({ url: 'https://site.test/article' });
+    assert.equal(body.summary, 'Back online.');
+    assert.equal(body.fallback, false);
   });
 });
 
@@ -374,6 +446,8 @@ describe('other routes', () => {
     const body = await (await realFetch(`${base}/api/health`)).json();
     assert.equal(body.status, 'ok');
     assert.equal(body.aiConfigured, true);
+    assert.deepEqual(body.models, ['Google Gemini: gemini-3.5-flash-lite', 'Google Gemini: gemini-3.1-flash-lite', 'Google Gemini: gemini-3.6-flash']);
+    assert.doesNotMatch(JSON.stringify(body), /test-key/);
   });
 
   it('returns JSON 404 for unknown API routes', async () => {

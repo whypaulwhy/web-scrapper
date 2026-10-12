@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { getProviderConfig, parseSummary, summarizePage } from '../src/summarizer.js';
+import { createCache } from '../src/cache.js';
+import { extractiveSummary, getAttemptPlan, getProviderConfig, parseSummary, summarizePage } from '../src/summarizer.js';
 
 describe('parseSummary', () => {
   it('parses a clean JSON reply', () => {
@@ -50,5 +51,67 @@ describe('summarizePage', () => {
       summarizePage({ title: 't', url: 'https://example.com', text: 'x' }, {}),
       /missing API key/,
     );
+  });
+});
+
+describe('getAttemptPlan', () => {
+  it('tries the Gemini model, then the Gemini fallbacks, then Groq', () => {
+    const plan = getAttemptPlan({ GEMINI_API_KEY: 'g', GROQ_API_KEY: 'q' }).map((a) => `${a.id}:${a.model}`);
+    assert.deepEqual(plan, [
+      'gemini:gemini-3.5-flash-lite',
+      'gemini:gemini-3.1-flash-lite',
+      'gemini:gemini-3.6-flash',
+      'groq:llama-3.3-70b-versatile',
+    ]);
+  });
+
+  it('puts Groq first when AI_PROVIDER=groq', () => {
+    const plan = getAttemptPlan({ AI_PROVIDER: 'groq', GEMINI_API_KEY: 'g', GROQ_API_KEY: 'q' });
+    assert.equal(plan[0].id, 'groq');
+  });
+
+  it('honours custom fallback lists, including an empty one', () => {
+    assert.deepEqual(
+      getAttemptPlan({ GEMINI_API_KEY: 'g', GEMINI_MODEL: 'a', GEMINI_FALLBACK_MODELS: 'b, a ,c' }).map((a) => a.model),
+      ['a', 'b', 'c'],
+    );
+    assert.equal(getAttemptPlan({ GEMINI_API_KEY: 'g', GEMINI_FALLBACK_MODELS: '' }).length, 1);
+  });
+
+  it('is empty without any key', () => {
+    assert.deepEqual(getAttemptPlan({}), []);
+  });
+});
+
+describe('extractiveSummary', () => {
+  it('uses the opening sentences of real paragraphs, skipping short lines', () => {
+    const text = 'Menu\nHome\nThe first real sentence of the article is right here. The second one follows it closely. A third sentence ends the paragraph. A fourth is not needed.';
+    assert.equal(
+      extractiveSummary({ description: '', text }),
+      'The first real sentence of the article is right here. The second one follows it closely. A third sentence ends the paragraph.',
+    );
+  });
+
+  it('falls back to the raw text when nothing looks like a sentence', () => {
+    assert.equal(extractiveSummary({ description: '', text: 'just a few words' }), 'just a few words');
+  });
+});
+
+describe('createCache', () => {
+  it('expires entries and evicts the oldest when full', async () => {
+    const cache = createCache({ ttlMs: 20, maxEntries: 2 });
+    cache.set('a', 1);
+    cache.set('b', 2);
+    cache.set('c', 3);
+    assert.equal(cache.get('a'), undefined);
+    assert.equal(cache.get('c'), 3);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(cache.get('c'), undefined);
+  });
+
+  it('stores nothing when the TTL is zero', () => {
+    const cache = createCache({ ttlMs: 0, maxEntries: 2 });
+    cache.set('a', 1);
+    assert.equal(cache.size, 0);
   });
 });
