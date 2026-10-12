@@ -81,6 +81,8 @@ export default function App() {
       const data = await summarizeUrl(trimmed, controller.signal);
       setResult(data);
       setStatus('done');
+      // A page extract shown while the AI is unavailable isn't worth keeping in the history.
+      if (data.fallback) return;
       setRecent((items) => {
         const next = [data, ...items.filter((item) => item.url !== data.url)].slice(0, MAX_RECENT);
         saveRecent(next);
@@ -256,6 +258,8 @@ function Summary({ result }) {
       </a>
       <h2 className="summary-title">{result.title}</h2>
 
+      {result.fallback && <p className="notice">{result.notice}</p>}
+
       <p className="summary-text">{result.summary}</p>
 
       {result.keyPoints.length > 0 && (
@@ -272,8 +276,8 @@ function Summary({ result }) {
       <p className="provenance">
         From {result.wordCount.toLocaleString()} words on the page, about {minutes} {minutes === 1 ? 'minute' : 'minutes'}{' '}
         of reading.
-        {result.truncated && ' The page is long, so only its first part was summarized.'} Summarized by{' '}
-        {result.model}.
+        {!result.fallback && result.truncated && ' The page is long, so only its first part was summarized.'}
+        {!result.fallback && ` Summarized by ${result.model}.`}
       </p>
 
       <div className="actions">

@@ -311,6 +311,14 @@ h1 {
   overflow-wrap: anywhere;
 }
 
+.notice {
+  margin: 0 0 1.25rem;
+  padding-left: 0.875rem;
+  border-left: 2px solid var(--line-strong);
+  color: var(--ink-2);
+  font-size: 0.9375rem;
+}
+
 .summary-text {
   margin: 0;
   font-family: var(--serif);
