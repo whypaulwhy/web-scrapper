@@ -19,7 +19,7 @@ Gist is a full-stack web app. You paste a link to a webpage and click **Summariz
 - **Frontend (React + Vite):** a link field and a **Summarize** button. While the backend works, the button says **"Loading..."**, a progress line runs under the field, and a timer shows how long it's taking. The summary is laid out like a reading view: source, title, summary, main points, word count and reading time, with buttons to copy the summary or open the page. Errors appear right under the field and say what to do next. Your last five summaries are saved in the browser so you can reopen them instantly. Works on phones, supports light and dark mode, and can be used with the keyboard alone.
 - **Backend (Node.js + Express):** a `POST /api/summarize` endpoint that takes the URL from the frontend.
 - **Scraping (fetch + Cheerio):** downloads the HTML and removes scripts, styles, navigation, headers, footers, sidebars and hidden elements. It then pulls the text out of the main `<article>`/`<main>` area (falling back to `<body>`) in a single linear pass, so even a 6 MB page takes under a second.
-- **AI integration:** sends the scraped text to **Google Gemini** (`gemini-3.5-flash-lite`) or **Groq** (`llama-3.3-70b-versatile`). Both have free tiers, and nothing uses OpenAI. The model returns JSON (`summary` + `keyPoints`), and the prompt tells it to treat page text as data, not instructions.
+- **AI integration:** sends the scraped text to **Google Gemini** (`gemini-3.5-flash-lite`) or **Groq** (`openai/gpt-oss-120b`). Both have free tiers, and nothing uses OpenAI. The model returns JSON (`summary` + `keyPoints`), and the prompt tells it to treat page text as data, not instructions.
 - **Safety & robustness:** the URL is validated, and requests to localhost and private networks are blocked (SSRF protection), including on every redirect. Requests stop after 15 s or 3 MB, follow at most 5 redirects, and anything that isn't HTML or plain text is rejected. HTML nested absurdly deep is refused, requests are rate-limited per IP, and every failure returns a readable error message.
 - **Built to keep working:** if a Gemini model is rate-limited or down, the backend tries backup models and then Groq. If no AI can be reached at all, it shows the page's opening sentences, clearly labelled. Summaries are cached, and the live site is checked automatically every 6 hours (see [Reliability](#reliability)).
 - **Tests:** 95 automated tests covering URL validation, SSRF bypass tricks, HTML extraction, AI reply parsing, the fallback chain, caching and full API worst cases (see [Testing](#testing)). They run on GitHub Actions on every push.
@@ -113,7 +113,8 @@ All supported variables:
 | `AI_PROVIDER`    | no       | auto                      | `gemini` or `groq`. If unset, uses whichever key is present (Gemini first). |
 | `GEMINI_MODEL`   | no       | `gemini-3.5-flash-lite`   | Gemini model to try first                                          |
 | `GEMINI_FALLBACK_MODELS` | no | `gemini-3.1-flash-lite,gemini-3.6-flash` | Comma-separated Gemini models to try next if the first fails. Set it to an empty value to disable. |
-| `GROQ_MODEL`     | no       | `llama-3.3-70b-versatile` | Groq model to use                                                  |
+| `GROQ_MODEL`     | no       | `openai/gpt-oss-120b`     | Groq model to try first                                            |
+| `GROQ_FALLBACK_MODELS` | no | `openai/gpt-oss-20b`  | Comma-separated Groq models to try next. Set it to an empty value to disable. |
 | `PORT`           | no       | `3001`                    | Port for the local backend                                         |
 | `CORS_ORIGIN`    | no       | `*`                       | Allowed origin if the frontend is hosted on another domain         |
 | `RATE_LIMIT_PER_MINUTE` | no | `15`                    | Summaries allowed per minute per IP address                        |
@@ -248,8 +249,8 @@ The live demo has to keep working for days without anyone watching it, so a sing
 | Risk | What happens |
 | ---- | ------------ |
 | A Gemini model hits its free quota or is overloaded | The next model in `GEMINI_FALLBACK_MODELS` is tried. Each model has its own free quota. |
-| A Gemini model is retired | Same: it is skipped and the next one is used. |
-| Gemini is down or the key stops working | If `GROQ_API_KEY` is set, Groq takes over. |
+| A model is retired | It is skipped and the next one is used. This already happened once: the live Groq key was refused access to `llama-3.3-70b-versatile`, so Groq now uses `openai/gpt-oss-120b` with `openai/gpt-oss-20b` as backup. |
+| Gemini is down or the key stops working | Groq takes over (`GROQ_API_KEY` is set on the live deployment). |
 | No AI can be reached at all | The page's description or opening sentences are shown, with a notice saying it isn't an AI summary. The user never gets a blank error. |
 | The same link is summarized again and again | The summary is reused for 6 hours, so it doesn't burn quota. |
 | Something breaks anyway | `.github/workflows/live-check.yml` calls the live `/api/health` and summarizes a real page every 6 hours. If that fails, GitHub emails the repo owner. |

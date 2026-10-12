@@ -1,22 +1,24 @@
 // Per attempt. Several models may be tried in a row, so each one gets a modest budget.
 const AI_TIMEOUT_MS = 25_000;
 
-// Tried in order after GEMINI_MODEL when a model is rate-limited, unavailable or failing.
-// Each Gemini model has its own free-tier quota, so falling back also spreads the load.
-const DEFAULT_GEMINI_FALLBACK_MODELS = ['gemini-3.1-flash-lite', 'gemini-3.6-flash'];
-
+// `defaultFallbacks` are tried in order after the main model when it is rate-limited, retired or
+// failing. Each model has its own free-tier quota, so falling back also spreads the load.
 const PROVIDERS = {
   gemini: {
     label: 'Google Gemini',
     keyEnv: 'GEMINI_API_KEY',
     modelEnv: 'GEMINI_MODEL',
+    fallbackEnv: 'GEMINI_FALLBACK_MODELS',
     defaultModel: 'gemini-3.5-flash-lite',
+    defaultFallbacks: ['gemini-3.1-flash-lite', 'gemini-3.6-flash'],
   },
   groq: {
     label: 'Groq',
     keyEnv: 'GROQ_API_KEY',
     modelEnv: 'GROQ_MODEL',
-    defaultModel: 'llama-3.3-70b-versatile',
+    fallbackEnv: 'GROQ_FALLBACK_MODELS',
+    defaultModel: 'openai/gpt-oss-120b',
+    defaultFallbacks: ['openai/gpt-oss-20b'],
   },
 };
 
@@ -88,7 +90,7 @@ export function getAttemptPlan(env = process.env) {
     const apiKey = (env[provider.keyEnv] || '').trim();
     if (!apiKey) continue;
     const primary = (env[provider.modelEnv] || '').trim() || provider.defaultModel;
-    const fallbacks = id === 'gemini' ? parseModelList(env.GEMINI_FALLBACK_MODELS, DEFAULT_GEMINI_FALLBACK_MODELS) : [];
+    const fallbacks = parseModelList(env[provider.fallbackEnv], provider.defaultFallbacks);
     const models = [...new Set([primary, ...fallbacks])];
     plans[id] = models.map((model) => ({ id, label: provider.label, apiKey, model }));
   }
